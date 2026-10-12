@@ -1,0 +1,33 @@
+# SSH hosts for the Flipper One VM. Use them from ~/.ssh/config with one line at the top:
+#   Include ~/FlipperOneVM/ssh_config
+# then: ssh flipper-one / ssh flipper-build, or pick them in VS Code Remote-SSH.
+# The address is the VMware VM's (NAT, usually stable); ./flipper looks it up each time.
+
+# The Flipper One itself (FlipperOS, arm64, emulated): user / user
+Host flipper-one
+    HostName 192.168.165.128
+    Port 2222
+    User user
+    IdentityFile ~/FlipperOneVM/run/vm_key
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+
+# The x86 build host (Debian 13 in VMware): Rust + aarch64 cross toolchain, flipctl-slint in ~/src
+Host flipper-build
+    HostName 192.168.165.128
+    User user
+    IdentityFile ~/FlipperOneVM/run/vm_key
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+
+# The run.sh VM (QEMU on the Mac), when it's running
+Host flipper-local
+    HostName 127.0.0.1
+    Port 2222
+    User user
+    IdentityFile ~/FlipperOneVM/run/vm_key
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR

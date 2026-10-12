@@ -1,0 +1,29 @@
+# Downloaded third-party tooling and VM artifacts — rebuilt/fetched by the scripts, never committed.
+vmware/
+images/
+downloads/
+kernel/
+qemu/
+env/
+mamba/
+apps/
+bin/
+src/
+
+# Generated keys, sockets, logs, disk images
+run/vm_key
+run/vm_key.pub
+run/*.sock
+run/*.log
+*.log
+*.qcow2
+*.vmdk
+*.img
+*.img.*
+*.deb
+*.tar
+*.xz
+*.zst
+*.conda
+*.AppImage
+.DS_Store

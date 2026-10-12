@@ -1,0 +1,214 @@
+#!/bin/busybox sh
+# Flipper One VM initramfs: boot a FlipperOS profile subvolume with the Debian
+# arm64 kernel on QEMU "virt". Cmdline knobs (same names the real BLS entries use):
+#   root=/dev/vda3   rootflags=subvol=@Desktop   init=/sbin/init   rdshell
+/bin/busybox mkdir -p /bin /proc /sys /dev /newroot
+/bin/busybox --install -s /bin
+export PATH=/bin
+
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+
+say() { echo "flipper-vm: $*"; }
+rescue() { say "$*"; say "dropping to a shell (exit to retry boot)"; setsid cttyhack sh; }
+
+KVER=$(uname -r)
+ROOT=/dev/vda3 FLAGS= INIT=/sbin/init RDSHELL= NODISPLAY=0
+for a in $(cat /proc/cmdline); do
+	case "$a" in
+		root=*) ROOT=${a#root=} ;;
+		rootflags=*) FLAGS=${a#rootflags=} ;;
+		init=*) INIT=${a#init=} ;;
+		flippervm.tz=*) VMTZ=${a#flippervm.tz=} ;;
+		flippervm.nodisplay) NODISPLAY=1 ;;
+		rdshell) RDSHELL=1 ;;
+	esac
+done
+
+for m in $(cat /lib/modules/load-order); do
+	insmod /lib/modules/$m.ko 2>/dev/null || grep -q "^$m " /proc/modules || say "insmod $m failed"
+done
+
+case "$ROOT" in UUID=*|LABEL=*) ROOT=$(findfs "$ROOT") ;; esac
+i=0
+while [ ! -b "$ROOT" ] && [ $i -lt 100 ]; do sleep 0.2; i=$((i+1)); done
+[ -b "$ROOT" ] || rescue "root device $ROOT never appeared"
+
+until mount -t btrfs -o "rw,noatime${FLAGS:+,$FLAGS}" "$ROOT" /newroot; do
+	rescue "mounting $ROOT ($FLAGS) failed"
+done
+say "mounted $ROOT ${FLAGS}"
+
+# Each profile is its own subvolume, so each needs this kernel's modules (and its image,
+# which the boot menu's entries name) once.
+MODS=/usr/lib/modules/$KVER
+if [ ! -e /newroot$MODS/modules.dep ] || [ ! -e /newroot$MODS/vmlinuz ]; then
+	MODDISK=
+	for d in /dev/vd?; do
+		[ "$(dd if=$d bs=1 skip=257 count=5 2>/dev/null)" = ustar ] && MODDISK=$d
+	done
+	if [ -n "$MODDISK" ]; then
+		say "installing $KVER modules from $MODDISK (first boot of this profile)"
+		mkdir -p /newroot/usr/lib/modules
+		tar -xf "$MODDISK" -C /newroot/usr/lib/modules &&
+			chroot /newroot /usr/sbin/depmod -a "$KVER" ||
+			say "module install failed; devices may be missing"
+	else
+		say "no modules disk attached; devices may be missing"
+	fi
+fi
+
+# The host's timezone, so the Flipper's clock matches the Mac's.
+if [ -n "${VMTZ:-}" ] && [ -f "/newroot/usr/share/zoneinfo/$VMTZ" ] &&
+	[ "$(readlink /newroot/etc/localtime)" != "../usr/share/zoneinfo/$VMTZ" ]; then
+	ln -sf "../usr/share/zoneinfo/$VMTZ" /newroot/etc/localtime
+	echo "$VMTZ" > /newroot/etc/timezone
+	say "timezone $VMTZ"
+fi
+
+# Boot menu: give every profile an entry for the kernel and device tree this VM runs, so
+# Flipper's boot-profile soft-reboots into it (a "pivot") instead of trying to kexec an
+# RK3576 kernel. Rewritten on every boot: the live device tree and command line are the
+# VM's own and differ between run.sh and VMware, and a pivot needs both to match.
+setup_profiles() {
+	mkdir -p /top
+	mount -t btrfs -o subvolid=5 "$ROOT" /top || return 1
+	mkdir -p /newroot/mnt/.vmtop
+	mount --bind /top /newroot/mnt/.vmtop
+	E=/top/boot/loader/entries HW=/top/boot/loader/entries-rk3576
+	mkdir -p "$E" "$HW" /top/boot/vm
+	cat /sys/firmware/fdt > /top/boot/vm/qemu-virt.dtb
+	OPTS=""
+	for a in $(cat /proc/cmdline); do
+		case "$a" in root=*|rootflags=*) ;; *) OPTS="$OPTS $a" ;; esac
+	done
+	subvol_of() { sed -n 's/^options.*rootflags=subvol=\([^ ,]*\).*/\1/p' "$1" | head -n1; }
+	# This kernel's modules (and image) and the host's timezone, in profile $1.
+	prepare() {
+		if [ ! -e "/top/$1$MODS/modules.dep" ] || [ ! -e "/top/$1$MODS/vmlinuz" ]; then
+			say "boot menu: adding $KVER to $1"
+			mkdir -p "/top/$1/usr/lib/modules"
+			rm -rf "/top/$1$MODS"
+			# GNU cp from the booted profile: on btrfs the copy shares its blocks.
+			chroot /newroot cp -a --reflink=auto "$MODS" "/mnt/.vmtop/$1/usr/lib/modules/" ||
+				say "boot menu: copying modules into $1 failed"
+		fi
+		if [ -n "${VMTZ:-}" ] && [ -f "/top/$1/usr/share/zoneinfo/$VMTZ" ]; then
+			ln -sf "../usr/share/zoneinfo/$VMTZ" "/top/$1/etc/localtime"
+			echo "$VMTZ" > "/top/$1/etc/timezone"
+		fi
+	}
+	seen=" "
+	# Entries for this kernel - ours from an earlier boot, or one create-profile wrote for a
+	# clone - are kept and brought up to date; one whose profile is gone is dropped. Any
+	# other entry names an RK3576 kernel: kept, but out of the menu's way.
+	for f in "$E"/*.conf; do
+		[ -e "$f" ] || continue
+		if ! grep -q "^version *$KVER\$" "$f"; then mv "$f" "$HW/"; continue; fi
+		sv=$(subvol_of "$f")
+		if [ -z "$sv" ] || [ ! -d "/top/$sv/usr" ]; then rm -f "$f"; continue; fi
+		case "$seen" in *" $sv "*) rm -f "$f"; continue ;; esac
+		seen="$seen$sv "
+		prepare "$sv"
+		sed -i -e "s|^options.*|options    root=$ROOT$OPTS rootflags=subvol=$sv|" \
+			-e "s|^linux .*|linux      /$sv$MODS/vmlinuz|" \
+			-e '/^initrd/d' -e '/^devicetree/d' "$f"
+		echo "devicetree /boot/vm/qemu-virt.dtb" >> "$f"
+	done
+	# A profile with none yet gets one, named and ordered like the board's own entry.
+	for f in $(ls "$HW"/*.conf 2>/dev/null | sort -r); do
+		sv=$(subvol_of "$f")
+		[ -n "$sv" ] && [ -d "/top/$sv/usr" ] || continue
+		case "$seen" in *" $sv "*) continue ;; esac
+		seen="$seen$sv "
+		case "$NODISPLAY:$sv" in 1:@Desktop|1:@TV-Media-Box) continue ;; esac
+		name=${sv#@}
+		nnn=$(basename "$f" | cut -d- -f1)
+		label=$(sed -n 's/^title[[:space:]]*//p' "$f" | head -n1 | sed 's/ [^ ]*$//')
+		key=$(sed -n 's/^sort-key[[:space:]]*//p' "$f" | head -n1)
+		prepare "$sv"
+		# No "+" in the file name: boot counting would read "+deb13-arm64" as its counter.
+		cat > "$E/$nnn-flipperos-$name-$(echo "$KVER" | tr + _).conf" <<EOF
+title      ${label:-$name} (VM)
+version    $KVER
+sort-key   ${key:-debian-$nnn-$name}
+options    root=$ROOT$OPTS rootflags=subvol=$sv
+linux      /$sv$MODS/vmlinuz
+devicetree /boot/vm/qemu-virt.dtb
+EOF
+	done
+	umount /newroot/mnt/.vmtop
+	rmdir /newroot/mnt/.vmtop 2>/dev/null
+	umount /top
+}
+setup_profiles || say "boot menu setup failed; switching profiles from the Flipper will not work"
+
+# VM-only tweaks live on a tmpfs /run (systemd keeps it), so the profile on disk stays stock.
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /newroot/run
+mkdir -p /newroot/run/systemd/system/flipctl.service.d
+cat > /newroot/run/systemd/system/flipctl.service.d/90-vm-headless.conf <<'EOF'
+# No SPI panel or buttons in the VM: serve only flipctl's browser view of the
+# Flipper One screen (port 8899, forwarded to the host by run.sh). --all-kernels: the
+# boot menu hides kernels before 7.0, and the VM boots Debian's 6.12.
+[Service]
+Environment=XDG_SEAT=
+ExecStart=
+ExecStart=/usr/bin/flipctl --headless --all-kernels --remote 0.0.0.0:8899 --assets /usr/share/flipctl/assets/remote
+# Hosted apps: the VM's GPU (if any) has no Mesa driver, so composite and capture
+# app frames on the CPU instead of failing to allocate GPU buffers.
+Environment=WLR_RENDERER=pixman
+Environment=FLIPCTL_NO_GPU=1
+EOF
+
+# The VM's one network card carries the panel view and SSH, so it must always get an
+# address, whatever the profile does: @Router turns NetworkManager's automatic DHCP off
+# (no-auto-default) and bridges its own LAN. A keyfile in /run outranks none of that
+# but adds a connection of its own for the virtio card.
+mkdir -p /newroot/run/NetworkManager/system-connections
+cat > /newroot/run/NetworkManager/system-connections/vm-uplink.nmconnection <<'EOF'
+[connection]
+id=VM uplink
+type=ethernet
+autoconnect=true
+autoconnect-priority=100
+
+[match]
+driver=virtio_net
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+EOF
+chmod 600 /newroot/run/NetworkManager/system-connections/vm-uplink.nmconnection
+
+# Testing > flipctl2 stops flipctl and hands the panel to the prototype (node server +
+# cog on the SPI panel). Neither exists here, and cog crash-loops, so make the server
+# refuse to start: the handover's own fallback then starts flipctl straight back.
+mkdir -p /newroot/run/systemd/system/fake-flipctl-node-server.service.d \
+	/newroot/run/systemd/system/cog-seat1.service.d
+printf '[Service]\nExecStartPre=/bin/false\nRestart=no\n' \
+	> /newroot/run/systemd/system/fake-flipctl-node-server.service.d/zz-vm-disabled.conf
+printf '[Unit]\nConditionPathExists=/dev/dri/by-path/platform-2acf0000.spi-cs-0-card\n' \
+	> /newroot/run/systemd/system/cog-seat1.service.d/zz-vm-disabled.conf
+
+# KDE: there is no GPU, the CPU is emulated, and the image's Mesa only has softpipe, so
+# OpenGL compositing never gets a frame out. Draw with QPainter / Qt Quick's software
+# backend instead, and give Plasma time to start. The drop-ins are named zz-* so they
+# sort after the image's own override.conf (which pins KWIN_COMPOSE=O2).
+mkdir -p /newroot/run/environment.d /newroot/run/systemd/user/plasma-kwin_wayland.service.d \
+	/newroot/run/systemd/user/plasma-plasmashell.service.d
+echo QT_QUICK_BACKEND=software > /newroot/run/environment.d/90-flipper-vm.conf
+printf '[Service]\nEnvironment=KWIN_COMPOSE=Q\nTimeoutStartSec=15min\n' \
+	> /newroot/run/systemd/user/plasma-kwin_wayland.service.d/zz-vm.conf
+printf '[Service]\nTimeoutStartSec=15min\n' \
+	> /newroot/run/systemd/user/plasma-plasmashell.service.d/zz-vm.conf
+
+[ -n "$RDSHELL" ] && rescue "rdshell requested (root is at /newroot)"
+
+[ -x "/newroot$INIT" ] || [ -L "/newroot$INIT" ] || rescue "no $INIT in root"
+umount /proc /sys
+mount --move /dev /newroot/dev
+exec switch_root /newroot "$INIT"

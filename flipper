@@ -1,0 +1,125 @@
+#!/bin/bash
+# flipper - the dev loop for the Flipper One VM.
+#
+#   ./flipper [--local] <command> [args]
+#
+#   ssh [cmd]               shell on the Flipper (user / user, sudo)
+#   host [cmd]              shell on the x86 build host (the VMware Debian VM)
+#   push <file> [folder]    install an app (.fap.py / .fap.AppImage) into ~/Apps/<folder> (default Dev)
+#   run <file> [folder]     push it, open it on the panel, wait for its first frame, screenshot
+#   logs [app]              the app's last error output and the panel's recent log
+#   shot [out.png]          panel screenshot (default run/panel.png)
+#   hdmi [out.png]          HDMI / desktop screenshot (VMware only; default run/hdmi.png)
+#   press <key>...          press device keys: up down left right ok back esc view power edit run appsw
+#   build <app-dir>         cross-build a Rust/Slint app (a dir like flipctl-slint's apps/sysmon) on the
+#                           build host with Flipper's bundler, then push + run the AppImage
+#   sync <dir> [dest]       copy a source folder to the Flipper (default ~/src/<name>)
+#
+# --local targets the run.sh VM (localhost) instead of the VMware one.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+VMRUN="/Applications/VMware Fusion.app/Contents/Library/vmrun"
+VMX="$ROOT/vmware/Flipper One.vmwarevm/Flipper One.vmx"
+KEY="$ROOT/run/vm_key"
+SSHO=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10)
+[ -f "$KEY" ] && SSHO+=(-i "$KEY")
+
+LOCAL=0
+if [ "${1:-}" = --local ]; then LOCAL=1; shift; fi
+cmd=${1:-help}
+[ $# -gt 0 ] && shift
+
+if [ "$cmd" = help ] || [ "$cmd" = -h ] || [ "$cmd" = --help ]; then
+	sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+	exit 0
+fi
+
+if [ $LOCAL = 1 ]; then
+	FLIP=127.0.0.1 BUILD=""
+else
+	FLIP=$("$VMRUN" -T fusion getGuestIPAddress "$VMX" -wait 2>/dev/null) ||
+		{ echo "The VMware VM isn't running (start it, or use --local)" >&2; exit 1; }
+	BUILD=$FLIP
+fi
+PANEL="$FLIP:8899"
+
+fssh() { ssh "${SSHO[@]}" -p 2222 "user@$FLIP" "$@"; }
+bssh() {
+	[ -n "$BUILD" ] || { echo "the build host is the VMware VM; not available with --local" >&2; exit 1; }
+	ssh "${SSHO[@]}" "user@$BUILD" "$@"
+}
+SUDO='echo user | sudo -S -p ""'
+
+push() {
+	local file=$1 folder=${2:-Dev} name
+	name=$(basename "$file")
+	[ -f "$file" ] || { echo "no such file: $file" >&2; exit 1; }
+	fssh "mkdir -p ~/Apps/'$folder' && cat > ~/Apps/'$folder'/'$name' && chmod 755 ~/Apps/'$folder'/'$name'" < "$file"
+	echo "~/Apps/$folder/$name"
+}
+
+wait_frame() {   # $1 = epoch the app was opened at
+	local i out
+	for i in $(seq 1 30); do
+		out=$(fssh "$SUDO journalctl -t flipctl --since @$1 --no-pager -o cat" 2>/dev/null || true)
+		case "$out" in
+			*"lit bytes"*) return 0 ;;
+			*"drew nothing"*) echo "(slow first frame: bringing it back to the front)"
+				fssh "XDG_RUNTIME_DIR=/run/user/1000 flipctl open ~/Apps/$2" >/dev/null || true
+				set -- "$(date +%s)" "$2" ;;
+			*"ended"*) echo "the app exited - see: ./flipper logs" >&2; return 1 ;;
+		esac
+		sleep 2
+	done
+	return 1
+}
+
+run_app() {
+	local file=$1 folder=${2:-Dev} rel since
+	push "$file" "$folder" >/dev/null
+	rel="$folder/$(basename "$file")"
+	since=$(fssh date +%s)
+	fssh "XDG_RUNTIME_DIR=/run/user/1000 flipctl open ~/Apps/'$rel'"
+	if wait_frame "$since" "$rel"; then
+		sleep 2
+		python3 "$ROOT/scripts/panel.py" --host "$PANEL" shot "$ROOT/run/panel.png" >/dev/null
+		echo "running; panel: $ROOT/run/panel.png"
+	else
+		echo "no frame yet; try ./flipper shot in a moment, or ./flipper logs" >&2
+	fi
+}
+
+case "$cmd" in
+	ssh)   exec ssh -t "${SSHO[@]}" -p 2222 "user@$FLIP" "$@" ;;
+	host)  [ -n "$BUILD" ] || { echo "no build host with --local" >&2; exit 1; }
+	       exec ssh -t "${SSHO[@]}" "user@$BUILD" "$@" ;;
+	push)  push "$@" ;;
+	run)   run_app "$@" ;;
+	logs)
+		app=${1:-}
+		fssh "for f in ~/.local/share/flipctl/apps/*${app}*/last-error.log; do [ -s \"\$f\" ] && { echo \"== \$f\"; tail -40 \"\$f\"; }; done; echo '== panel log'; $SUDO journalctl -t flipctl -n 60 --no-pager -o cat | grep -v -E 'handled on|latency| key |ALSA|underrun' | tail -25" ;;
+	shot)  python3 "$ROOT/scripts/panel.py" --host "$PANEL" shot "${1:-$ROOT/run/panel.png}" ;;
+	press) python3 "$ROOT/scripts/panel.py" --host "$PANEL" press "$@" ;;
+	hdmi)
+		out=${1:-$ROOT/run/hdmi.png}
+		bssh "$SUDO flipper-hdmi-shot /tmp/hdmi.png >/dev/null && $SUDO cat /tmp/hdmi.png" > "$out"
+		echo "$out" ;;
+	sync)
+		src=${1:?usage: sync <dir> [dest]}; dest=${2:-src/$(basename "$src")}
+		COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -C "$(dirname "$src")" -cf - "$(basename "$src")" |
+			fssh "mkdir -p ~/'$(dirname "$dest")' && tar -xf - -C ~/'$(dirname "$dest")' && echo synced to ~/$dest" ;;
+	build)
+		dir=${1:?usage: build <app-dir>}; name=$(basename "$dir")
+		[ -f "$dir/app.toml" ] || { echo "$dir has no app.toml (a flipctl app manifest)" >&2; exit 1; }
+		echo "-> sending $name to the build host"
+		COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata --exclude target -C "$(dirname "$dir")" -cf - "$name" |
+			bssh "rm -rf ~/src/flipctl-slint/apps/'$name' && tar -xf - -C ~/src/flipctl-slint/apps"
+		echo "-> building (cargo cross-compiles for aarch64; the first build of a Slint app is slow)"
+		bssh ". ~/.cargo/env && cd ~/src/flipctl-slint && tools/appimage/build.sh --native apps/'$name' 2>&1 | tail -3"
+		mkdir -p "$ROOT/apps/build"
+		art="$name-aarch64.fap.AppImage"
+		bssh "cat ~/src/flipctl-slint/target/appimage/'$art'" > "$ROOT/apps/build/$art"
+		echo "-> built apps/build/$art ($(du -h "$ROOT/apps/build/$art" | cut -f1))"
+		run_app "$ROOT/apps/build/$art" Dev ;;
+	*) echo "unknown command: $cmd (try ./flipper help)" >&2; exit 1 ;;
+esac
