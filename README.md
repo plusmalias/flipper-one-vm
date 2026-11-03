@@ -1,10 +1,40 @@
-# Flipper One VM
+<div align="center">
 
-Runs the official Flipper One firmware image (FlipperOS = Debian 13 arm64, nightly
-build **2315**, 2026-10-03, `flipper-one` target from dl-linux-images.flipp.dev) on this
-Intel Mac under QEMU. There is no official VM; this is a home-made one.
+# 🐬 Flipper One VM
 
-## Screenshots
+### Run the official Flipper One firmware on a Mac, before you have the hardware.
+
+**A home-made virtual machine for the Flipper One.** It boots the real FlipperOS image
+(Debian 13 arm64) under QEMU on an Intel Mac, with the device's **live front-panel UI in your browser**,
+SSH, a KDE desktop, a VMware build, and a full dev loop for building Flipper One apps.
+There is no official VM; this is one.
+
+![QEMU](https://img.shields.io/badge/QEMU-11.1.2-FF6600?logo=qemu&logoColor=white)
+![FlipperOS](https://img.shields.io/badge/FlipperOS-Debian%2013%20arm64-A81D33?logo=debian&logoColor=white)
+![Host](https://img.shields.io/badge/host-Intel%20Mac-999999?logo=apple&logoColor=white)
+![VMware](https://img.shields.io/badge/VMware%20Fusion-supported-607078?logo=vmware&logoColor=white)
+![Build](https://img.shields.io/badge/firmware%20build-2315-orange)
+
+[Screenshots](#-screenshots) · [Use it](#-use-it) · [VMware](#-vmware-version) · [Develop](#-developing-for-flipper-one) · [How it works](#-how-it-works)
+
+</div>
+
+---
+
+## 🔭 At a glance
+
+| | |
+|---|---|
+| 🖥️ **The real firmware** | Official nightly image (build **2315**, 2026-10-03, `flipper-one` target), not a mock-up |
+| 🎛️ **Live front panel** | The device's own `flipctl` UI at `http://localhost:8899`. Click the buttons or use the keyboard |
+| 🧩 **Every boot profile** | Desktop (KDE), Minimal, No-Graphics, TV-Media-Box, Router, plus a `@Dev` profile with a full toolchain |
+| 📦 **Two ways to run** | `./run.sh` (QEMU) or a double-click **VMware Fusion** VM that boots straight to the Flipper UI |
+| 🛠️ **Dev loop** | `./flipper push / run / shot / logs / build`, a native-speed x86 build host, RP2350 MCU + kernel builds, Rust/Slint apps |
+| ♻️ **Safe to break** | A read-only factory image with your changes layered on top. `./run.sh --reset` takes you back to factory |
+
+---
+
+## 📸 Screenshots
 
 | Flipper One front panel | KDE desktop | sysmon panel |
 |---|---|---|
@@ -12,7 +42,11 @@ Intel Mac under QEMU. There is no official VM; this is a home-made one.
 
 The front-panel UI (`flipctl`) is served live at http://localhost:8899.
 
-## Use it
+> **What's in this repo:** the launch scripts, initramfs/boot tooling, front-panel helper, dev-kit and
+> build-host setup. The large pieces (the firmware image, the QEMU build and its conda env, the Debian
+> kernel and the VMware bundle) are downloaded or built locally and aren't checked in.
+
+## 🚀 Use it
 
 ```sh
 cd ~/FlipperOneVM
@@ -36,7 +70,7 @@ cd ~/FlipperOneVM
   desktop takes ~4–5 min (the first boot of each profile adds ~1 min); KDE is usable
   but sluggish. Headless profiles are much lighter.
 
-## VMware version
+## 🧊 VMware version
 
 `vmware/Flipper One.vmwarevm` — double-click it (VMware Fusion). It opens straight
 onto the Flipper One device: a boot splash on its screen, then the live UI with
@@ -58,7 +92,7 @@ slower than `run.sh`; ~1.5 min to the Flipper UI (first boot of a profile ~3 min
   emulate on the same 4 cores.
 - `vmware/payload/` holds what was installed into it (service, kiosk, splash page).
 
-## Apps & device functions
+## 📱 Apps & device functions
 
 - **Utilities** (Apps › Utilities on the Flipper): Clock (clock/stopwatch/timer),
   Calculator, Commands (system info), Notes (on-screen keyboard, kept in ~/Notes),
@@ -74,7 +108,7 @@ slower than `run.sh`; ~1.5 min to the Flipper UI (first boot of a profile ~3 min
 - `scripts/panel.py` grabs the panel as a PNG or presses keys, e.g.
   `python3 scripts/panel.py --host <VM IP>:8899 shot panel.png`.
 
-## Developing for Flipper One
+## 🛠️ Developing for Flipper One
 
 - **Dev profile** (`@Dev`, a clone of Desktop, so KDE included): the on-device toolkit
   lives here — compilers & build systems, gdb/strace/valgrind/perf, Python dev, Rust,
@@ -103,7 +137,7 @@ Where upstream work happens (all on github.com/flipperdevices): `flipperone-linu
 help-wanted list: https://docs.flipper.net/one/open-tasks — and a community index:
 https://github.com/hypery11/awesome-flipper-one
 
-## How it works
+## ⚙️ How it works
 
 - `qemu/` — QEMU 11.1.2 built from `downloads/qemu-11.1.2.tar.xz` (deps from conda-forge in `env/`;
   the binary links to `env/lib`, so don't move or delete `env/`).
@@ -119,7 +153,7 @@ https://github.com/hypery11/awesome-flipper-one
   Quick's software backend (the image's Mesa only has softpipe); USB-gadget and
   repart services masked.
 
-## What doesn't work
+## 🚧 What doesn't work
 
 Anything that needs the real board: Wi-Fi/BT/cellular radios, the RP2350 MCU
 (buttons, LEDs, power), GPIO/SPI/I2C, the GPU, USB gadget mode, audio. The front-panel
@@ -127,10 +161,19 @@ UI runs only as the browser view. Logging out of KDE hands the screen to the SDD
 greeter, which doesn't get the software-rendering tweak and will likely stay black;
 use `./ssh.sh sudo reboot` instead.
 
-## Newer builds
+## 🔄 Newer builds
 
 Images appear at https://dl-linux-images.flipp.dev/full-img/ (manifest.json per build).
 To switch: download `debian-512-flipper-one-<N>.img.zst`, decompress with
 `env/bin/zstd -d`, run `python3 scripts/grow-gpt.py <img> 32`, convert with
 `qemu/bin/qemu-img convert -O qcow2`, then point `FACTORY` in `run.sh` at it and run
 `./run.sh --reset`.
+
+---
+
+<div align="center">
+
+Built by <b>Jorden Armstrong</b>. An unofficial community project, not affiliated with Flipper Devices.
+Issues and ideas welcome: open an <a href="../../issues">issue</a>.
+
+</div>
